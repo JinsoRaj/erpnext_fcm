@@ -1,65 +1,70 @@
 import frappe
 import requests
 import json
-from frappe import enqueue
 import re
+import os
+from frappe import enqueue
+from google.oauth2 import service_account
+from google.auth.transport.requests import Request
 
+# Load service account credentials once
+SERVICE_ACCOUNT_FILE = os.path.join(os.path.dirname(__file__), "fcm.json")
+SCOPES = ["https://www.googleapis.com/auth/firebase.messaging"]
+
+_creds = service_account.Credentials.from_service_account_file(
+    SERVICE_ACCOUNT_FILE, scopes=SCOPES
+)
+
+def get_access_token():
+    global _creds
+    if not _creds.valid:
+        _creds.refresh(Request())
+    return _creds.token
 
 def user_id(doc):
-    user_email = doc.for_user
-    user_device_id = frappe.get_all(
-        "User Device", filters={"user": user_email}, fields=["device_id"]
+    return frappe.get_all(
+        "User Device", filters={"user": doc.for_user}, fields=["device_id"]
     )
-    return user_device_id
-
 
 @frappe.whitelist()
 def send_notification(doc, event):
-    device_ids = user_id(doc)
-    for device_id in device_ids:
+    for device in user_id(doc):
         enqueue(
             process_notification,
             queue="default",
             now=False,
-            device_id=device_id,
-            notification=doc,
+            device_id=device.device_id,
+            doc_type=doc.document_type,
+            doc_name=doc.document_name,
+            title=doc.subject,
+            body=doc.email_content,
         )
 
+def strip_html(text):
+    return re.sub(re.compile(r"<.*?>"), "", text or "")
 
-def convert_message(message):
-    CLEANR = re.compile("<.*?>")
-    cleanmessage = re.sub(CLEANR, "", message)
-    # cleantitle = re.sub(CLEANR, "",title)
-    return cleanmessage
+def process_notification(device_id, doc_type, doc_name, title, body):
+    title = strip_html(title) or "Notification"
+    body = strip_html(body) or ""
 
-
-def process_notification(device_id, notification):
-    message = notification.email_content
-    title = notification.subject
-    if message:
-        message = convert_message(message)
-    if title:
-        title = convert_message(title)
-
-    url = "https://fcm.googleapis.com/fcm/send"
-    body = {
-        "to": device_id.device_id,
-        "notification": {"body": message, "title": title},
-        "data": {
-            "doctype": notification.document_type,
-            "docname": notification.document_name,
-        },
+    url = f"https://fcm.googleapis.com/v1/projects/{_creds.project_id}/messages:send"
+    message = {
+        "message": {
+            "token": device_id,
+            "notification": {"title": title, "body": body},
+            "data": {"doctype": doc_type, "docname": doc_name},
+        }
     }
 
-    server_key = frappe.db.get_single_value("FCM Notification Settings", "server_key")
-    auth = f"Bearer {server_key}"
-    req = requests.post(
-        url=url,
-        data=json.dumps(body),
-        headers={
-            "Authorization": auth,
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
-    )
-    frappe.log_error(req.text)
+    headers = {
+        "Authorization": f"Bearer {get_access_token()}",
+        "Content-Type": "application/json; UTF-8",
+    }
+
+    resp = requests.post(url, headers=headers, json=message)
+
+    if resp.status_code != 200:
+        frappe.log_error(
+            title=f"FCM v1 Send Error {resp.status_code}",
+            message=f"To: {device_id}\nBody: {json.dumps(message, indent=2)}\nResp: {resp.text}",
+        )
